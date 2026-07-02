@@ -1,141 +1,136 @@
-import os
-import logging
 import asyncio
+import logging
+import os
 from collections import defaultdict
 
+import httpx
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-import google.generativeai as genai
-
-# ---------- Настройка ----------
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MODEL = os.getenv("MODEL", "anthropic/claude-sonnet-4.5")
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # сообщений на пользователя
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN не задан в .env")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY не задан в .env")
+if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
+    raise RuntimeError("Заполните TELEGRAM_TOKEN и OPENROUTER_API_KEY в .env")
 
-genai.configure(api_key=GEMINI_API_KEY)
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+dp = Dispatcher()
+
 SYSTEM_PROMPT = (
-    "Ты дружелюбный ИИ-ассистент в Telegram-чате. "
-    "Отвечай кратко, понятно и по делу. Используй русский язык, "
-    "если пользователь не пишет на другом."
+    "Ты — опытный senior-разработчик и ассистент по программированию. "
+    "Отвечай точно, по делу, с рабочим кодом. "
+    "Оформляй код в markdown-блоках с указанием языка. "
+    "Если задача неоднозначна — делай разумное предположение и говори какое, "
+    "не задавай лишних уточняющих вопросов без необходимости. "
+    "Объясняй кратко, если пользователь явно не просит подробностей."
 )
 
-# Храним историю диалога по каждому чату (в памяти, сбрасывается при рестарте бота)
-chat_histories: dict[int, list] = defaultdict(list)
-MAX_HISTORY_MESSAGES = 20  # сколько последних сообщений держим в контексте
-
-# ---------- Работа с Gemini ----------
-
-def get_model():
-    return genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=SYSTEM_PROMPT,
-    )
+# История диалога по пользователям (in-memory, сбрасывается при перезапуске)
+history: dict[int, list[dict]] = defaultdict(list)
 
 
-async def ask_gemini(chat_id: int, user_text: str) -> str:
-    history = chat_histories[chat_id]
+async def ask_ai(user_id: int, user_text: str) -> str:
+    history[user_id].append({"role": "user", "content": user_text})
+    # ограничиваем историю, чтобы не разрастался контекст
+    history[user_id] = history[user_id][-MAX_HISTORY:]
 
-    model = get_model()
-    chat = model.start_chat(history=history)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[user_id]
 
-    def _send():
-        return chat.send_message(user_text)
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": messages,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    # google-generativeai синхронный, запускаем в отдельном потоке,
-    # чтобы не блокировать событийный цикл бота
-    response = await asyncio.to_thread(_send)
-
-    # Обновляем сохранённую историю и обрезаем её, чтобы не росла бесконечно
-    chat_histories[chat_id] = chat.history[-MAX_HISTORY_MESSAGES:]
-
-    return response.text
+    reply = data["choices"][0]["message"]["content"]
+    history[user_id].append({"role": "assistant", "content": reply})
+    return reply
 
 
-# ---------- Хендлеры Telegram ----------
+def split_message(text: str, limit: int = 4000) -> list[str]:
+    """Telegram режет сообщения длиннее ~4096 символов — бьём по кускам."""
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    while text:
+        parts.append(text[:limit])
+        text = text[limit:]
+    return parts
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_histories[update.effective_chat.id] = []
-    await update.message.reply_text(
-        "Привет! Я ИИ-ассистент на Gemini. Просто напиши вопрос — отвечу.\n\n"
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    history[message.from_user.id].clear()
+    await message.answer(
+        "Привет! Я ИИ-ассистент по программированию.\n\n"
+        "Просто напиши свой вопрос или задачу — помогу с кодом, отладкой, "
+        "архитектурой, объясню алгоритм и т.д.\n\n"
         "Команды:\n"
         "/reset — очистить историю диалога\n"
-        "/help — помощь"
+        "/model — показать текущую модель"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Пиши любой вопрос текстом, я отвечу с помощью Gemini.\n"
-        "/reset — забыть предыдущий контекст разговора"
-    )
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message):
+    history[message.from_user.id].clear()
+    await message.answer("История диалога очищена.")
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_histories[update.effective_chat.id] = []
-    await update.message.reply_text("Контекст диалога очищен ✅")
+@dp.message(Command("model"))
+async def cmd_model(message: Message):
+    await message.answer(f"Текущая модель: `{MODEL}`")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
+@dp.message(F.text)
+async def handle_message(message: Message):
+    await bot.send_chat_action(message.chat.id, "typing")
     try:
-        answer = await ask_gemini(chat_id, user_text)
-    except Exception as e:
-        logger.exception("Ошибка при обращении к Gemini")
-        await update.message.reply_text(
-            f"Упс, что-то пошло не так при обращении к Gemini: {e}"
+        reply = await ask_ai(message.from_user.id, message.text)
+    except httpx.HTTPStatusError as e:
+        logger.exception("Ошибка API")
+        await message.answer(
+            f"Ошибка при обращении к ИИ (HTTP {e.response.status_code}). "
+            "Проверьте ключ OpenRouter и баланс на счету."
         )
         return
+    except Exception:
+        logger.exception("Неожиданная ошибка")
+        await message.answer("Произошла ошибка. Попробуйте ещё раз.")
+        return
 
-    # Telegram режет сообщения длиннее 4096 символов — бьём на части
-    for i in range(0, len(answer), 4000):
-        await update.message.reply_text(answer[i : i + 4000])
+    for chunk in split_message(reply):
+        try:
+            await message.answer(chunk)
+        except Exception:
+            # если markdown в ответе битый — отправляем как обычный текст
+            await message.answer(chunk, parse_mode=None)
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Исключение при обработке update: %s", context.error)
-
-
-# ---------- Точка входа ----------
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-
-    logger.info("Бот запущен, ждём сообщений...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+async def main():
+    logger.info("Бот запускается...")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
